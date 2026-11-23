@@ -54,6 +54,7 @@ DEFAULT_STYLE = {
 
 
 def inject_custom_css():
+  """Inject custom styling for the Streamlit dashboard."""
   st.markdown(
       """
         <style>
@@ -159,7 +160,7 @@ def inject_custom_css():
 
 
 def ensure_weights_exist(weights_path: Path, weights_url: str) -> bool:
-  """يتحقق من وجود ملف الأوزان محلياً أو يحمّله تلقائياً من GitHub Releases."""
+  """Ensure model weights exist locally or download them from the release URL."""
   if weights_path.exists() and weights_path.stat().st_size > 0:
     return True
 
@@ -181,9 +182,238 @@ def ensure_weights_exist(weights_path: Path, weights_url: str) -> bool:
 
 @st.cache_resource(show_spinner=False)
 def load_model(weights_path_str: str):
-  """تحميل نموذج YOLO وتخزينه في الذاكرة المؤقتة."""
+  """Load and cache the YOLO model."""
   return YOLO(weights_path_str)
 
 
 def summarize_detections(result) -> tuple[int, list[dict]]:
-  """استخراج إجمالي الص
+  """Summarize total detections and per-class counts and peak confidence."""
+  boxes = result.boxes
+  names = result.names or {}
+
+  if boxes is None or len(boxes) == 0:
+    return 0, []
+
+  cls_ids = boxes.cls.cpu().numpy().astype(int).tolist()
+  confs = boxes.conf.cpu().numpy().tolist()
+
+  counts = Counter(cls_ids)
+  max_conf_per_cls = {}
+  for cid, c in zip(cls_ids, confs):
+    if cid not in max_conf_per_cls or c > max_conf_per_cls[cid]:
+      max_conf_per_cls[cid] = c
+
+  summary_rows = []
+  for cid, count in counts.most_common():
+    raw_label = str(names.get(cid, cid))
+    key_lower = raw_label.lower().strip()
+    meta = CLASS_META.get(key_lower, {})
+    display_label = meta.get("label", raw_label)
+    color = meta.get("color", DEFAULT_STYLE["color"])
+    bg = meta.get("bg", DEFAULT_STYLE["bg"])
+    border = meta.get("border", DEFAULT_STYLE["border"])
+
+    summary_rows.append({
+        "raw_key": key_lower,
+        "Class": display_label,
+        "Detections": count,
+        "Max Confidence": f"{max_conf_per_cls[cid]:.2f}",
+        "color": color,
+        "bg": bg,
+        "border": border,
+    })
+
+  return len(cls_ids), summary_rows
+
+
+inject_custom_css()
+
+with st.sidebar:
+  st.markdown("### ⚙️ Inference Settings")
+  conf_threshold = st.slider(
+      "Confidence Threshold (`conf`)",
+      min_value=0.05,
+      max_value=0.95,
+      value=0.25,
+      step=0.05,
+      help="Minimum confidence score required to keep a detected bounding box.",
+  )
+  iou_threshold = st.slider(
+      "IoU Threshold (`iou`)",
+      min_value=0.10,
+      max_value=0.90,
+      value=0.45,
+      step=0.05,
+      help="Intersection-over-Union threshold for Non-Maximum Suppression.",
+  )
+  img_size = st.selectbox(
+      "Image Size (`imgsz`)",
+      options=[640, 800, 1024],
+      index=0,
+      help="Inference resolution passed to YOLO26m.",
+  )
+  use_tta = st.checkbox(
+      "Enable Test-Time Augmentation (`TTA`)",
+      value=False,
+      help="Applies augmentation during inference for potentially stronger recall.",
+  )
+
+  st.markdown("---")
+  st.markdown("### 🎯 Target Damage Classes")
+  st.markdown(
+      """
+        - **Crack** — Longitudinal / transverse cracks
+        - **Alligator** — Interconnected fatigue cracking
+        - **Block** — Rectangular interlocking cracks
+        - **Pothole** — Pavement surface cavities
+        """
+  )
+  st.caption("Model: **YOLO26m** | Instant AI Diploma — DataSpace #2")
+
+st.markdown(
+    """
+    <div class="hero-banner">
+        <div class="hero-badge">COMPUTER VISION • OBJECT DETECTION • YOLO26m</div>
+        <h1 class="hero-title">🛣️ Road Damage Detection Inspector</h1>
+        <p class="hero-sub">
+            Upload a road surface image to detect <strong>crack</strong>, <strong>alligator</strong>,
+            <strong>block</strong>, and <strong>pothole</strong> damages, inspect per-class counts, and
+            tune inference thresholds in real time.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+weights_ready = ensure_weights_exist(WEIGHTS_PATH, WEIGHTS_URL)
+if not weights_ready:
+  st.error(
+      "Model weights (`best.pt`) were not found locally and could not be"
+      " downloaded automatically."
+  )
+  st.stop()
+
+with st.spinner("Loading YOLO26m model..."):
+  model = load_model(str(WEIGHTS_PATH))
+
+uploaded_file = st.file_uploader(
+    "📤 Upload a road image (JPG, JPEG, PNG)",
+    type=["jpg", "jpeg", "png"],
+)
+
+if uploaded_file is not None:
+  image = Image.open(uploaded_file).convert("RGB")
+  image_np = np.array(image)
+
+  with st.spinner("Analyzing road surface..."):
+    results = model.predict(
+        source=image_np,
+        conf=conf_threshold,
+        iou=iou_threshold,
+        imgsz=img_size,
+        augment=use_tta,
+        verbose=False,
+    )
+
+  result = results[0]
+  annotated_bgr = result.plot()
+  annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+  annotated_pil = Image.fromarray(annotated_rgb)
+
+  total_detections, summary_rows = summarize_detections(result)
+  unique_classes = len(summary_rows)
+  top_conf = summary_rows[0]["Max Confidence"] if summary_rows else "—"
+
+  st.markdown(
+      f"""
+        <div class="kpi-grid">
+            <div class="kpi-card">
+                <div class="kpi-label">Total Detections</div>
+                <div class="kpi-value">{total_detections}</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Damage Types Found</div>
+                <div class="kpi-value">{unique_classes}</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Peak Confidence</div>
+                <div class="kpi-value">{top_conf}</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Active Config</div>
+                <div class="kpi-value" style="font-size: 1.15rem; padding-top: 0.35rem;">
+                    conf={conf_threshold:.2f} | sz={img_size}
+                </div>
+            </div>
+        </div>
+        """,
+      unsafe_allow_html=True,
+  )
+
+  col1, col2 = st.columns(2, gap="large")
+  with col1:
+    st.markdown(
+        '<div class="section-heading">📷 Original Image</div>',
+        unsafe_allow_html=True,
+    )
+    st.image(image, use_container_width=True)
+
+  with col2:
+    st.markdown(
+        '<div class="section-heading">🎯 Detected Road Damages</div>',
+        unsafe_allow_html=True,
+    )
+    st.image(annotated_pil, use_container_width=True)
+
+  st.markdown(
+      '<div class="section-heading">📊 Class Summary</div>',
+      unsafe_allow_html=True,
+  )
+
+  if summary_rows:
+    cards_html = ['<div class="class-grid">']
+    for row in summary_rows:
+      cards_html.append(
+          f"""
+                <div class="class-card" style="background: {row['bg']}; border-color: {row['border']};">
+                    <div class="class-name" style="color: {row['color']};">{row['Class']}</div>
+                    <div class="class-count">{row['Detections']} detected</div>
+                    <div class="class-conf">Max confidence: {row['Max Confidence']}</div>
+                </div>
+                """
+      )
+    cards_html.append("</div>")
+    st.markdown("".join(cards_html), unsafe_allow_html=True)
+
+    with st.expander("📋 View Tabular Summary"):
+      st.dataframe(
+          [
+              {
+                  "Class": r["Class"],
+                  "Detections": r["Detections"],
+                  "Max Confidence": r["Max Confidence"],
+              }
+              for r in summary_rows
+          ],
+          use_container_width=True,
+          hide_index=True,
+      )
+  else:
+    st.info(
+        "No road damages were detected at the current confidence threshold. Try"
+        " lowering `conf`, increasing `imgsz`, or enabling `TTA`."
+    )
+
+  buf = io.BytesIO()
+  annotated_pil.save(buf, format="PNG")
+  st.download_button(
+      label="⬇️ Download Annotated Image (PNG)",
+      data=buf.getvalue(),
+      file_name=f"predicted_{Path(uploaded_file.name).stem}.png",
+      mime="image/png",
+  )
+else:
+  st.info(
+      "👆 Upload a road image above to run **YOLO26m** inference and view"
+      " detected damage categories."
+  )
